@@ -1,4 +1,4 @@
-# ReelSaverNative 1.5.0
+# ReelSaverNative 1.6.0
 
 Нативный Android/Cordova-модуль ReelSave отвечает только за:
 

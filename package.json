@@ -1,6 +1,6 @@
 {
   "name": "com.artem.reelsaver.native",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Cordova Android bridge for ReelSave public Reel resolving/downloading. Ads are handled by the separate YandexMobileAds GDevelop extension.",
   "cordova": {
     "id": "com.artem.reelsaver.native",

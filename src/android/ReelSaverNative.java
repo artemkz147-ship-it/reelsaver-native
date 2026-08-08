@@ -79,6 +79,8 @@ public class ReelSaverNative extends CordovaPlugin {
     private static final Pattern SJS_SCRIPT = Pattern.compile("<script\\b[^>]*\\bdata-sjs[^>]*>(.*?)</script>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
     private volatile String pendingSharedUrl = "";
+    private volatile String browserUserAgent = USER_AGENT;
+    private volatile String lastResolvedPageUrl = "https://www.instagram.com/";
 
     @Override
     protected void pluginInitialize() {
@@ -670,6 +672,8 @@ public class ReelSaverNative extends CordovaPlugin {
             final Handler handler = new Handler(Looper.getMainLooper());
             final AtomicBoolean finished = new AtomicBoolean(false);
             final AtomicReference<String> interceptedVideo = new AtomicReference<>("");
+            final AtomicBoolean browserApiStarted = new AtomicBoolean(false);
+            final AtomicBoolean embedFallbackLoaded = new AtomicBoolean(false);
             final long startedAt = System.currentTimeMillis();
 
             webView.getSettings().setJavaScriptEnabled(true);
@@ -677,7 +681,11 @@ public class ReelSaverNative extends CordovaPlugin {
             webView.getSettings().setDatabaseEnabled(true);
             webView.getSettings().setLoadsImagesAutomatically(true);
             webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
-            webView.getSettings().setUserAgentString(USER_AGENT);
+            // Keep the real Android WebView UA. A forged desktop/mobile Chrome UA with
+            // a different TLS/browser fingerprint is much more likely to be gated by Instagram.
+            String realWebViewUa = webView.getSettings().getUserAgentString();
+            if (realWebViewUa != null && !realWebViewUa.trim().isEmpty()) browserUserAgent = realWebViewUa;
+            webView.getSettings().setCacheMode(android.webkit.WebSettings.LOAD_NO_CACHE);
             webView.getSettings().setUseWideViewPort(true);
             webView.getSettings().setLoadWithOverviewMode(false);
             webView.getSettings().setJavaScriptCanOpenWindowsAutomatically(false);
@@ -700,8 +708,7 @@ public class ReelSaverNative extends CordovaPlugin {
             final Runnable timeout = () -> {
                 if (!finished.compareAndSet(false, true)) return;
                 cleanup.run();
-                String suffix = directError == null || directError.isEmpty() ? "" : " (HTTP-парсер: " + directError + ")";
-                callback.error("Не удалось найти MP4 после загрузки публичной страницы Instagram." + suffix);
+                callback.error("Не удалось получить видео. Попробуйте ещё раз чуть позже.");
             };
             handler.postDelayed(timeout, WEBVIEW_TIMEOUT_MS);
 
@@ -712,6 +719,15 @@ public class ReelSaverNative extends CordovaPlugin {
                 public void run() {
                     if (finished.get()) return;
                     attempts++;
+
+                    String currentShortcode = initialShortcode.isEmpty()
+                            ? extractShortcode(webView.getUrl()) : initialShortcode;
+                    if (!currentShortcode.isEmpty() && browserApiStarted.compareAndSet(false, true)) {
+                        try {
+                            String mediaId = shortcodeToMediaId(currentShortcode);
+                            webView.evaluateJavascript(webViewApiFetchScript(currentShortcode, mediaId), ignored -> {});
+                        } catch (Exception ignored) {}
+                    }
 
                     String captured = interceptedVideo.get();
                     if (!captured.isEmpty()) {
@@ -759,6 +775,8 @@ public class ReelSaverNative extends CordovaPlugin {
                 @Override
                 public void onPageFinished(WebView view, String url) {
                     super.onPageFinished(view, url);
+                    browserApiStarted.set(false);
+                    try { CookieManager.getInstance().flush(); } catch (Exception ignored) {}
                     handler.post(poller);
                 }
 
@@ -788,7 +806,27 @@ public class ReelSaverNative extends CordovaPlugin {
             headers.put("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7");
             headers.put("Referer", "https://www.instagram.com/");
             webView.loadUrl(source.toString(), headers);
-            handler.postDelayed(poller, 1400);
+            handler.postDelayed(poller, 1200);
+
+            // If the normal Reel page is login-gated or does not start media playback,
+            // switch the same browser session to Instagram's embed page. The embed
+            // renderer is intentionally usable on third-party pages and often exposes
+            // the public video when the normal logged-out page does not.
+            handler.postDelayed(() -> {
+                if (finished.get() || initialShortcode.isEmpty() || !embedFallbackLoaded.compareAndSet(false, true)) return;
+                browserApiStarted.set(false);
+                String embedUrl = "https://www.instagram.com/reel/" + initialShortcode + "/embed/";
+                webView.loadUrl(embedUrl, headers);
+            }, 8500);
+
+            handler.postDelayed(() -> {
+                if (finished.get() || initialShortcode.isEmpty()) return;
+                String current = webView.getUrl() == null ? "" : webView.getUrl();
+                if (current.contains("/embed/")) {
+                    browserApiStarted.set(false);
+                    webView.loadUrl("https://www.instagram.com/reel/" + initialShortcode + "/embed/captioned/", headers);
+                }
+            }, 15000);
         });
     }
 
@@ -810,6 +848,11 @@ public class ReelSaverNative extends CordovaPlugin {
     private void sendResolved(CallbackContext callback, URL source, String shortcode,
                               ReelInfo info, String resolver) {
         try {
+            if (info.finalPageUrl != null && !info.finalPageUrl.trim().isEmpty()) {
+                lastResolvedPageUrl = info.finalPageUrl;
+            } else if (source != null) {
+                lastResolvedPageUrl = source.toString();
+            }
             JSONObject json = new JSONObject();
             json.put("sourceUrl", source.toString());
             json.put("finalPageUrl", info.finalPageUrl);
@@ -843,6 +886,31 @@ public class ReelSaverNative extends CordovaPlugin {
                 "})()";
     }
 
+    private String webViewApiFetchScript(String shortcode, String mediaId) {
+        String safeShortcode = shortcode == null ? "" : shortcode.replace("\\", "\\\\").replace("'", "\\'");
+        String safeMediaId = mediaId == null ? "" : mediaId.replace("\\", "\\\\").replace("'", "\\'");
+        return "(function(){" +
+                "if(window.__reelsaverApiRunning)return;window.__reelsaverApiRunning=true;window.__reelsaverApiResult={state:'loading'};" +
+                "var MID='" + safeMediaId + "',SC='" + safeShortcode + "',APP='" + IG_WEB_APP_ID + "',ASBD='" + IG_ASBD_ID + "',DOC='" + IG_GRAPHQL_DOC_ID + "';" +
+                "function ck(n){var a=(document.cookie||'').split(';');for(var i=0;i<a.length;i++){var p=a[i].trim();if(p.indexOf(n+'=')===0)return decodeURIComponent(p.substring(n.length+1));}return '';}" +
+                "function lsd(){try{var e=document.getElementById('__eqmc');if(e){var j=JSON.parse(e.textContent||'{}');if(j&&j.l)return j.l;}}catch(e){}" +
+                "var h='';try{h=document.documentElement.innerHTML||'';}catch(e){}var m=h.match(/\\[\\\"LSD\\\",\\[\\],\\{\\\"token\\\":\\\"([^\\\"]+)/);return m?m[1]:'';}" +
+                "function norm(u){return typeof u==='string'&&/^https:/i.test(u)?u:'';}" +
+                "function scan(v,d){if(!v||d>80)return '';if(Array.isArray(v)){for(var i=0;i<v.length;i++){var r=scan(v[i],d+1);if(r)return r;}return '';}if(typeof v!=='object')return '';" +
+                "if(Array.isArray(v.video_versions)){var b='',bs=-1;for(var j=0;j<v.video_versions.length;j++){var q=v.video_versions[j]||{},u=norm(q.url||''),s=(q.width||1)*(q.height||1);if(u&&s>bs){b=u;bs=s;}}if(b)return b;}" +
+                "var x=norm(v.video_url||v.videoUrl||v.playback_url||v.playbackUrl||'');if(x)return x;for(var k in v){if(Object.prototype.hasOwnProperty.call(v,k)&&v[k]&&typeof v[k]==='object'){var z=scan(v[k],d+1);if(z)return z;}}return '';}" +
+                "async function run(){try{" +
+                "var base={'X-IG-App-ID':APP,'X-ASBD-ID':ASBD,'X-IG-WWW-Claim':'0','X-Requested-With':'XMLHttpRequest'};" +
+                "try{await fetch('/api/v1/web/get_ruling_for_content/?content_type=MEDIA&target_id='+encodeURIComponent(MID),{credentials:'include',headers:base,cache:'no-store'});}catch(e){}" +
+                "var L=lsd(),C=ck('csrftoken');if(!L)throw new Error('no_lsd');" +
+                "var body=new URLSearchParams();body.set('lsd',L);body.set('fb_api_caller_class','RelayModern');body.set('fb_api_req_friendly_name','PolarisLoggedOutDesktopWWWPostRootContentQuery');body.set('server_timestamps','true');body.set('variables',JSON.stringify({media_id:MID}));body.set('doc_id',DOC);" +
+                "var hd=Object.assign({},base,{'X-FB-Friendly-Name':'PolarisLoggedOutDesktopWWWPostRootContentQuery','X-FB-LSD':L,'Content-Type':'application/x-www-form-urlencoded'});if(C)hd['X-CSRFToken']=C;" +
+                "var r=await fetch('/api/graphql',{method:'POST',credentials:'include',headers:hd,body:body.toString(),cache:'no-store'});var t=await r.text();var j={};try{j=JSON.parse(t);}catch(e){}var u=scan(j,0);" +
+                "if(u){window.__reelsaverApiResult={state:'done',mediaUrl:u};return;}throw new Error('no_video');" +
+                "}catch(e){window.__reelsaverApiResult={state:'error',mediaUrl:'',error:String(e&&e.message||e)};}finally{window.__reelsaverApiRunning=false;}}run();return 'started';" +
+                "})()";
+    }
+
     private String decodeEvaluateJavascriptResult(String raw) {
         if (raw == null || raw.equals("null") || raw.equals("undefined")) return "";
         try {
@@ -872,7 +940,7 @@ public class ReelSaverNative extends CordovaPlugin {
             if (filename.isEmpty()) filename = defaultFilename();
             if (!filename.toLowerCase(Locale.US).endsWith(".mp4")) filename += ".mp4";
 
-            connection = openConnection(mediaUrl, "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5");
+            connection = openMediaConnection(mediaUrl);
             int code = connection.getResponseCode();
             if (code < 200 || code >= 300) throw new IOException("HTTP " + code + " при загрузке видео");
             validateDownloadUrl(connection.getURL());
@@ -964,6 +1032,25 @@ public class ReelSaverNative extends CordovaPlugin {
     private void cleanupPending(Uri uri) {
         if (uri == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
         try { cordova.getActivity().getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
+    }
+
+    private HttpURLConnection openMediaConnection(URL url) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setInstanceFollowRedirects(true);
+        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(READ_TIMEOUT_MS);
+        connection.setRequestProperty("User-Agent", browserUserAgent == null || browserUserAgent.trim().isEmpty() ? USER_AGENT : browserUserAgent);
+        connection.setRequestProperty("Accept", "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5");
+        connection.setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7");
+        connection.setRequestProperty("Accept-Encoding", "identity");
+        connection.setRequestProperty("Referer", lastResolvedPageUrl == null || lastResolvedPageUrl.trim().isEmpty()
+                ? "https://www.instagram.com/" : lastResolvedPageUrl);
+        connection.setRequestProperty("Cache-Control", "no-cache");
+        try {
+            String cookie = CookieManager.getInstance().getCookie(url.toString());
+            if (cookie != null && !cookie.trim().isEmpty()) connection.setRequestProperty("Cookie", cookie);
+        } catch (Exception ignored) {}
+        return connection;
     }
 
     private long contentLength(HttpURLConnection connection) {

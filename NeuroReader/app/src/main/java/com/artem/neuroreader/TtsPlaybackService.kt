@@ -19,8 +19,9 @@ import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
-import com.k2fsa.sherpa.onnx.OfflineTtsSupertonicModelConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import java.io.File
+import java.io.FileOutputStream
 import kotlin.math.max
 
 class TtsPlaybackService : Service() {
@@ -36,7 +37,6 @@ class TtsPlaybackService : Service() {
 
     @Volatile private var activeTextPath: String? = null
     @Volatile private var activeSpeed = 1.0f
-    @Volatile private var activeSid = 0
     @Volatile private var activeOffset = 0
 
     private val ttsLock = Any()
@@ -58,8 +58,6 @@ class TtsPlaybackService : Service() {
                     val textPath = intent?.getStringExtra(EXTRA_TEXT_PATH) ?: activeTextPath
                     val offset = intent?.getIntExtra(EXTRA_OFFSET, activeOffset) ?: activeOffset
                     val speed = intent?.getFloatExtra(EXTRA_SPEED, activeSpeed) ?: activeSpeed
-                    val sid = intent?.getIntExtra(EXTRA_NARRATOR_SID, activeSid) ?: activeSid
-
                     if (textPath.isNullOrBlank()) {
                         broadcastState(
                             offset = activeOffset,
@@ -69,29 +67,25 @@ class TtsPlaybackService : Service() {
                         )
                         stopSelf()
                     } else {
-                        startPlayback(
-                            textPath = textPath,
-                            requestedOffset = offset,
-                            speed = speed,
-                            sid = sid
-                        )
+                        startPlayback(textPath, offset, speed)
                     }
                 }
+
                 ACTION_PAUSE -> pausePlayback()
                 ACTION_RESUME -> resumePlayback()
                 ACTION_TOGGLE -> {
                     if (playing && !paused) pausePlayback()
                     else if (playing) resumePlayback()
-                    else activeTextPath?.let {
-                        startPlayback(it, activeOffset, activeSpeed, activeSid)
-                    }
+                    else activeTextPath?.let { startPlayback(it, activeOffset, activeSpeed) }
                 }
+
                 ACTION_SEEK -> {
                     val delta = intent?.getIntExtra(EXTRA_DELTA, 0) ?: 0
                     activeTextPath?.let {
-                        startPlayback(it, (activeOffset + delta).coerceAtLeast(0), activeSpeed, activeSid)
+                        startPlayback(it, (activeOffset + delta).coerceAtLeast(0), activeSpeed)
                     }
                 }
+
                 ACTION_STOP -> stopPlayback(removeNotification = true)
             }
         } catch (t: Throwable) {
@@ -113,12 +107,10 @@ class TtsPlaybackService : Service() {
     private fun startPlayback(
         textPath: String,
         requestedOffset: Int,
-        speed: Float,
-        sid: Int
+        speed: Float
     ) {
         activeTextPath = textPath
-        activeSpeed = speed.coerceIn(0.70f, 1.60f)
-        activeSid = sid.coerceIn(0, 9)
+        activeSpeed = speed.coerceIn(0.72f, 1.55f)
         activeOffset = requestedOffset.coerceAtLeast(0)
 
         generation += 1
@@ -130,7 +122,7 @@ class TtsPlaybackService : Service() {
 
         startForeground(
             NOTIFICATION_ID,
-            makeNotification("Готовлю офлайн-голос…", active = true)
+            makeNotification("Готовлю русский офлайн-голос…", active = true)
         )
         broadcastState(
             offset = activeOffset,
@@ -155,15 +147,14 @@ class TtsPlaybackService : Service() {
                     error = null,
                     ready = true
                 )
-                updateNotification("Читаю вслух", active = true)
+                updateNotification("Читаю вслух · Piper", active = true)
 
                 var position = activeOffset
-
                 while (myGeneration == generation && position < text.length) {
                     waitWhilePaused(myGeneration)
                     if (myGeneration != generation) break
 
-                    val utterance = nextUtterance(text, position, activeSid) ?: break
+                    val utterance = nextUtterance(text, position) ?: break
                     currentRangeStart = utterance.start
                     currentRangeEnd = utterance.end
 
@@ -173,20 +164,36 @@ class TtsPlaybackService : Service() {
                         error = null,
                         rangeStart = utterance.start,
                         rangeEnd = utterance.end,
-                        speaker = activeSid,
+                        speaker = 0,
                         ready = true
                     )
 
-                    synchronized(ttsLock) {
-                        if (myGeneration == generation) {
-                            streamUtterance(
-                                engine = engine,
-                                utterance = utterance,
-                                baseSpeed = activeSpeed,
-                                myGeneration = myGeneration
+                    val audio = synchronized(ttsLock) {
+                        if (myGeneration != generation) null
+                        else {
+                            val effectiveSpeed = (activeSpeed * utterance.speedFactor)
+                                .coerceIn(0.72f, 1.55f)
+                            engine.generateWithConfig(
+                                text = utterance.text,
+                                config = GenerationConfig(
+                                    silenceScale = utterance.silenceScale,
+                                    speed = effectiveSpeed,
+                                    sid = 0
+                                )
                             )
                         }
-                    }
+                    } ?: break
+
+                    if (myGeneration != generation) break
+                    require(audio.sampleRate > 0) { "Неверная частота аудио" }
+                    require(audio.samples.isNotEmpty()) { "Piper не вернул звук" }
+
+                    playGeneratedAudio(
+                        samples = audio.samples,
+                        sampleRate = audio.sampleRate,
+                        utterance = utterance,
+                        myGeneration = myGeneration
+                    )
                     if (myGeneration != generation) break
 
                     position = utterance.end
@@ -197,7 +204,7 @@ class TtsPlaybackService : Service() {
                         error = null,
                         rangeStart = utterance.start,
                         rangeEnd = utterance.end,
-                        speaker = activeSid,
+                        speaker = 0,
                         ready = true
                     )
                     playPause(utterance.pauseMs, myGeneration)
@@ -217,7 +224,7 @@ class TtsPlaybackService : Service() {
                     stopSelf()
                 }
             } catch (t: Throwable) {
-                Log.e(TAG, "TTS playback failed", t)
+                Log.e(TAG, "Piper playback failed", t)
                 if (myGeneration == generation) {
                     playing = false
                     paused = false
@@ -225,7 +232,7 @@ class TtsPlaybackService : Service() {
                     broadcastState(
                         offset = activeOffset,
                         isPlaying = false,
-                        error = "Ошибка озвучки: ${safeMessage(t)}",
+                        error = "Ошибка озвучки Piper: ${safeMessage(t)}",
                         ready = false
                     )
                     getSystemService(NotificationManager::class.java)
@@ -234,53 +241,76 @@ class TtsPlaybackService : Service() {
                     stopSelf()
                 }
             }
-        }, "NeuroReader-TTS").start()
+        }, "NeuroReader-Piper").start()
     }
 
     private fun ensureTts(): OfflineTts = synchronized(ttsLock) {
         tts?.let { return@synchronized it }
 
-        val modelDir = "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
-        val required = listOf(
-            "$modelDir/duration_predictor.int8.onnx",
-            "$modelDir/text_encoder.int8.onnx",
-            "$modelDir/vector_estimator.int8.onnx",
-            "$modelDir/vocoder.int8.onnx",
-            "$modelDir/tts.json",
-            "$modelDir/unicode_indexer.bin",
-            "$modelDir/voice.bin"
-        )
-        required.forEach { path ->
-            assets.open(path).use { input ->
-                require(input.read() >= 0) { "Нет файла модели: $path" }
-            }
-        }
+        val modelDir = "tts/vits-piper-ru_RU-irina-medium"
+        val model = "$modelDir/ru_RU-irina-medium.onnx"
+        val tokens = "$modelDir/tokens.txt"
+        assets.open(model).use { require(it.read() >= 0) { "Нет модели Piper" } }
+        assets.open(tokens).use { require(it.read() >= 0) { "Нет tokens.txt" } }
 
-        val supertonic = OfflineTtsSupertonicModelConfig(
-            durationPredictor = "$modelDir/duration_predictor.int8.onnx",
-            textEncoder = "$modelDir/text_encoder.int8.onnx",
-            vectorEstimator = "$modelDir/vector_estimator.int8.onnx",
-            vocoder = "$modelDir/vocoder.int8.onnx",
-            ttsJson = "$modelDir/tts.json",
-            unicodeIndexer = "$modelDir/unicode_indexer.bin",
-            voiceStyle = "$modelDir/voice.bin"
+        val espeakDir = prepareEspeakData()
+        val vits = OfflineTtsVitsModelConfig(
+            model = model,
+            tokens = tokens,
+            dataDir = espeakDir.absolutePath,
+            noiseScale = 0.62f,
+            noiseScaleW = 0.78f,
+            lengthScale = 1.0f
         )
-
         val config = OfflineTtsConfig(
             model = OfflineTtsModelConfig(
-                supertonic = supertonic,
-                numThreads = 2,
+                vits = vits,
+                numThreads = 1,
                 debug = false,
                 provider = "cpu"
             ),
             maxNumSentences = 1,
-            silenceScale = 0.28f
+            silenceScale = 0.24f
         )
 
         OfflineTts(assetManager = assets, config = config).also { engine ->
-            require(engine.sampleRate() > 0) { "Неверная частота Supertonic" }
-            require(engine.numSpeakers() >= 1) { "В модели нет голоса" }
+            require(engine.sampleRate() > 0) { "Piper не инициализировался" }
             tts = engine
+        }
+    }
+
+    private fun prepareEspeakData(): File {
+        val source = "tts/vits-piper-ru_RU-irina-medium/espeak-ng-data"
+        val root = File(noBackupFilesDir, "tts-runtime/piper-irina-v2")
+        val target = File(root, "espeak-ng-data")
+        val marker = File(root, ".ready")
+        val phontab = File(target, "phontab")
+
+        if (marker.isFile && phontab.isFile) return target
+
+        runCatching { root.deleteRecursively() }
+        target.mkdirs()
+        copyAssetTree(source, target)
+        require(phontab.isFile && phontab.length() > 0L) {
+            "Не удалось подготовить espeak-ng-data"
+        }
+        marker.writeText("ok", Charsets.UTF_8)
+        return target
+    }
+
+    private fun copyAssetTree(assetPath: String, destination: File) {
+        val children = assets.list(assetPath) ?: emptyArray()
+        if (children.isEmpty()) {
+            destination.parentFile?.mkdirs()
+            assets.open(assetPath).use { input ->
+                FileOutputStream(destination).use { output -> input.copyTo(output, 64 * 1024) }
+            }
+            return
+        }
+
+        destination.mkdirs()
+        children.forEach { child ->
+            copyAssetTree("$assetPath/$child", File(destination, child))
         }
     }
 
@@ -288,19 +318,18 @@ class TtsPlaybackService : Service() {
         val start: Int,
         val end: Int,
         val text: String,
-        val sid: Int,
         val pauseMs: Int,
         val speedFactor: Float,
         val silenceScale: Float
     )
 
-    private fun nextUtterance(full: String, start: Int, narratorSid: Int): Utterance? {
+    private fun nextUtterance(full: String, start: Int): Utterance? {
         var from = start.coerceIn(0, full.length)
         while (from < full.length && full[from].isWhitespace()) from++
         if (from >= full.length) return null
 
-        val hard = (from + 430).coerceAtMost(full.length)
-        val minBoundary = (from + 30).coerceAtMost(hard)
+        val hard = (from + 240).coerceAtMost(full.length)
+        val minBoundary = (from + 24).coerceAtMost(hard)
         var end = hard
         var clauseBoundary = -1
         var i = minBoundary
@@ -315,11 +344,11 @@ class TtsPlaybackService : Service() {
                 end = candidate
                 break
             }
-            if (c == '\n' && i > from + 45) {
+            if (c == '\n' && i > from + 35) {
                 end = i
                 break
             }
-            if ((c == ';' || c == ':') && i > from + 150 && clauseBoundary < 0) {
+            if ((c == ';' || c == ':') && i > from + 110 && clauseBoundary < 0) {
                 clauseBoundary = i + 1
             }
             i++
@@ -328,7 +357,7 @@ class TtsPlaybackService : Service() {
         if (end == hard && clauseBoundary > 0) end = clauseBoundary
         if (end == hard && hard < full.length) {
             var back = hard
-            while (back > from + 90) {
+            while (back > from + 70) {
                 if (full[back - 1].isWhitespace()) {
                     end = back
                     break
@@ -340,93 +369,93 @@ class TtsPlaybackService : Service() {
 
         val raw = full.substring(from, end)
         val spoken = russianProsody.prepare(raw)
-        if (spoken.isBlank()) return nextUtterance(full, end, narratorSid)
+        if (spoken.isBlank()) return nextUtterance(full, end)
 
         val trimmed = raw.trimEnd()
         val after = full.substring(end, minOf(full.length, end + 4))
         val pauseMs = when {
-            after.startsWith("\n\n") -> 470
-            after.startsWith("\n") -> 300
-            trimmed.endsWith("…") -> 360
-            trimmed.endsWith("?") -> 270
-            trimmed.endsWith("!") -> 245
-            trimmed.endsWith(":") -> 180
-            trimmed.endsWith(";") -> 165
-            else -> 145
+            after.startsWith("\n\n") -> 520
+            after.startsWith("\n") -> 320
+            trimmed.endsWith("…") -> 390
+            trimmed.endsWith("?") -> 300
+            trimmed.endsWith("!") -> 270
+            trimmed.endsWith(":") -> 205
+            trimmed.endsWith(";") -> 185
+            else -> 155
         }
 
         val commas = raw.count { it == ',' }
         val speedFactor = when {
-            trimmed.endsWith("…") -> 0.93f
-            trimmed.endsWith("?") -> 0.97f
+            trimmed.endsWith("…") -> 0.90f
+            trimmed.endsWith("?") -> 0.95f
             trimmed.endsWith("!") -> 1.01f
-            raw.length < 45 -> 0.97f
-            commas >= 3 -> 0.98f
+            raw.length < 42 -> 0.96f
+            commas >= 3 -> 0.96f
             else -> 1.0f
         }
-
         val silenceScale = when {
             trimmed.endsWith("…") -> 0.36f
-            trimmed.endsWith("?") -> 0.32f
-            trimmed.endsWith("!") -> 0.29f
-            commas >= 3 -> 0.31f
-            else -> 0.27f
+            trimmed.endsWith("?") -> 0.31f
+            trimmed.endsWith("!") -> 0.28f
+            commas >= 3 -> 0.30f
+            else -> 0.25f
         }
 
         return Utterance(
             start = from,
             end = end,
             text = spoken,
-            sid = narratorSid,
             pauseMs = pauseMs,
             speedFactor = speedFactor,
             silenceScale = silenceScale
         )
     }
 
-    private fun streamUtterance(
-        engine: OfflineTts,
+    private fun playGeneratedAudio(
+        samples: FloatArray,
+        sampleRate: Int,
         utterance: Utterance,
-        baseSpeed: Float,
         myGeneration: Int
     ) {
-        val sampleRate = engine.sampleRate()
-        require(sampleRate > 0) { "Некорректная частота аудио: $sampleRate" }
-
         val track = createAudioTrack(sampleRate)
         currentTrack = track
-        var samplesWritten = 0L
+        var sampleIndex = 0
         var lastProgressAt = 0L
-
-        val effectiveSpeed = (baseSpeed * utterance.speedFactor).coerceIn(0.70f, 1.60f)
-        val estimatedSeconds = max(
-            0.70,
-            utterance.text.length.coerceAtLeast(1).toDouble() / (13.0 * effectiveSpeed)
-        )
-        val estimatedSamples = max(sampleRate.toDouble() * estimatedSeconds, sampleRate * 0.5)
-
-        val config = GenerationConfig(
-            silenceScale = utterance.silenceScale,
-            speed = effectiveSpeed,
-            sid = utterance.sid,
-            numSteps = 8,
-            extra = mapOf("lang" to "ru")
-        )
+        val pcm = ShortArray(2048)
 
         try {
             track.play()
-            val callback: (FloatArray) -> Int = callback@{ samples ->
-                if (myGeneration != generation) return@callback 0
+            while (sampleIndex < samples.size && myGeneration == generation) {
+                if (paused) {
+                    runCatching { track.pause() }
+                    waitWhilePaused(myGeneration)
+                    if (myGeneration != generation) break
+                    runCatching { track.play() }
+                }
 
-                waitWhilePaused(myGeneration)
-                if (myGeneration != generation) return@callback 0
+                val count = minOf(pcm.size, samples.size - sampleIndex)
+                for (i in 0 until count) {
+                    val value = samples[sampleIndex + i].coerceIn(-1.0f, 1.0f)
+                    pcm[i] = (value * 32767.0f).toInt().toShort()
+                }
 
-                val writtenNow = writeSamples(track, samples, myGeneration)
-                samplesWritten += writtenNow.toLong().coerceAtLeast(0L)
+                var written = 0
+                while (written < count && myGeneration == generation) {
+                    val result = track.write(
+                        pcm,
+                        written,
+                        count - written,
+                        AudioTrack.WRITE_BLOCKING
+                    )
+                    if (result < 0) throw IllegalStateException("AudioTrack.write: $result")
+                    if (result == 0) continue
+                    written += result
+                }
+                sampleIndex += written
 
                 val now = SystemClock.elapsedRealtime()
-                if (now - lastProgressAt >= 220L) {
-                    val fraction = (samplesWritten / estimatedSamples).coerceIn(0.0, 0.985)
+                if (now - lastProgressAt >= 220L && samples.isNotEmpty()) {
+                    val fraction = (sampleIndex.toDouble() / samples.size.toDouble()).coerceIn(0.0, 0.995)
                     val offset = (
                         utterance.start +
                             ((utterance.end - utterance.start) * fraction).toInt()
@@ -438,19 +467,12 @@ class TtsPlaybackService : Service() {
                         error = null,
                         rangeStart = utterance.start,
                         rangeEnd = utterance.end,
-                        speaker = utterance.sid,
+                        speaker = 0,
                         ready = true
                     )
                     lastProgressAt = now
                 }
-                1
             }
-
-            engine.generateWithConfigAndCallback(
-                text = utterance.text,
-                config = config,
-                callback = callback
-            )
         } finally {
             runCatching { track.stop() }
             runCatching { track.release() }
@@ -462,9 +484,10 @@ class TtsPlaybackService : Service() {
         val minBytes = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_FLOAT
+            AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferBytes = max(minBytes, 24_576)
+        require(minBytes > 0) { "Телефон не поддержал PCM AudioTrack" }
+        val bufferBytes = max(minBytes, 16_384)
 
         val track = AudioTrack(
             AudioAttributes.Builder()
@@ -472,7 +495,7 @@ class TtsPlaybackService : Service() {
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build(),
             AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(sampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                 .build(),
@@ -486,36 +509,11 @@ class TtsPlaybackService : Service() {
         return track
     }
 
-    private fun writeSamples(track: AudioTrack, samples: FloatArray, myGeneration: Int): Int {
-        var written = 0
-        while (written < samples.size && myGeneration == generation) {
-            if (paused) {
-                runCatching { track.pause() }
-                waitWhilePaused(myGeneration)
-                if (myGeneration != generation) break
-                runCatching { track.play() }
-            }
-
-            val count = minOf(4096, samples.size - written)
-            val result = track.write(
-                samples,
-                written,
-                count,
-                AudioTrack.WRITE_BLOCKING
-            )
-            if (result < 0) throw IllegalStateException("AudioTrack.write: $result")
-            if (result == 0) continue
-            written += result
-        }
-        return written
-    }
-
     private fun playPause(milliseconds: Int, myGeneration: Int) {
         var remaining = milliseconds.coerceAtLeast(0)
         while (remaining > 0 && myGeneration == generation) {
             waitWhilePaused(myGeneration)
             if (myGeneration != generation) break
-
             val step = minOf(remaining, 35)
             try {
                 Thread.sleep(step.toLong())
@@ -547,28 +545,26 @@ class TtsPlaybackService : Service() {
             error = null,
             rangeStart = currentRangeStart,
             rangeEnd = currentRangeEnd,
-            speaker = activeSid,
+            speaker = 0,
             ready = engineReady
         )
     }
 
     private fun resumePlayback() {
         if (!playing) {
-            activeTextPath?.let {
-                startPlayback(it, activeOffset, activeSpeed, activeSid)
-            }
+            activeTextPath?.let { startPlayback(it, activeOffset, activeSpeed) }
             return
         }
         paused = false
         runCatching { currentTrack?.play() }
-        updateNotification("Читаю вслух", active = true)
+        updateNotification("Читаю вслух · Piper", active = true)
         broadcastState(
             offset = activeOffset,
             isPlaying = true,
             error = null,
             rangeStart = currentRangeStart,
             rangeEnd = currentRangeEnd,
-            speaker = activeSid,
+            speaker = 0,
             ready = engineReady
         )
     }
@@ -717,7 +713,7 @@ class TtsPlaybackService : Service() {
 
         const val EXTRA_TEXT_PATH = "text_path"
         const val EXTRA_SPEED = "speed"
-        const val EXTRA_NARRATOR_SID = "narrator_sid"
+        const val EXTRA_NARRATOR_SID = "narrator_sid" // kept for old installed versions; Piper ignores it
 
         private const val CHANNEL_ID = "neuroreader_tts"
         private const val NOTIFICATION_ID = 147

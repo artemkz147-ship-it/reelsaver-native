@@ -24,6 +24,7 @@ class ReaderStore(private val context: Context) {
             .putString(KEY_TITLE, title)
             .putString(KEY_TEXT_PATH, textFile.absolutePath)
             .putInt(KEY_OFFSET, 0)
+            .putBoolean(KEY_ROLES, false)
             .apply()
         return loadBook()!!
     }
@@ -37,7 +38,7 @@ class ReaderStore(private val context: Context) {
             offset = prefs.getInt(KEY_OFFSET, 0).coerceAtLeast(0),
             speed = prefs.getFloat(KEY_SPEED, 1.0f).coerceIn(0.65f, 1.8f),
             fontSize = prefs.getFloat(KEY_FONT_SIZE, 20f).coerceIn(14f, 36f),
-            rolesEnabled = prefs.getBoolean(KEY_ROLES, true),
+            rolesEnabled = false,
             narratorSid = prefs.getInt(KEY_NARRATOR_SID, 0).coerceIn(0, 9)
         )
     }
@@ -60,7 +61,9 @@ class ReaderStore(private val context: Context) {
     }
 
     fun updateRolesEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_ROLES, enabled).apply()
+        // Role reading was intentionally removed in v4. Keep the method so older
+        // UI code remains binary/source compatible while always using one narrator.
+        prefs.edit().putBoolean(KEY_ROLES, false).apply()
     }
 
     fun updateNarratorSid(sid: Int) {

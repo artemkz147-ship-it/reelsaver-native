@@ -122,7 +122,7 @@ class MainActivity : AppCompatActivity() {
         }
         scrollView = ScrollView(this).apply {
             isFillViewport = true
-            addView(readerView, ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(readerView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 setOnScrollChangeListener { _, _, scrollY, _, _ ->
                     if (currentText.isEmpty() || changingSeek) return@setOnScrollChangeListener

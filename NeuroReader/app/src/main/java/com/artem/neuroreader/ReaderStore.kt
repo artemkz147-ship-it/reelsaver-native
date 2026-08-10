@@ -11,7 +11,9 @@ class ReaderStore(private val context: Context) {
         val textPath: String,
         val offset: Int,
         val speed: Float,
-        val fontSize: Float
+        val fontSize: Float,
+        val rolesEnabled: Boolean,
+        val narratorSid: Int
     )
 
     fun saveBook(title: String, text: String): SavedBook {
@@ -33,8 +35,10 @@ class ReaderStore(private val context: Context) {
             title = prefs.getString(KEY_TITLE, "Книга") ?: "Книга",
             textPath = path,
             offset = prefs.getInt(KEY_OFFSET, 0).coerceAtLeast(0),
-            speed = prefs.getFloat(KEY_SPEED, 1.0f).coerceIn(0.5f, 2.0f),
-            fontSize = prefs.getFloat(KEY_FONT_SIZE, 20f).coerceIn(14f, 36f)
+            speed = prefs.getFloat(KEY_SPEED, 1.0f).coerceIn(0.65f, 1.8f),
+            fontSize = prefs.getFloat(KEY_FONT_SIZE, 20f).coerceIn(14f, 36f),
+            rolesEnabled = prefs.getBoolean(KEY_ROLES, true),
+            narratorSid = prefs.getInt(KEY_NARRATOR_SID, 0).coerceIn(0, 9)
         )
     }
 
@@ -48,11 +52,19 @@ class ReaderStore(private val context: Context) {
     }
 
     fun updateSpeed(speed: Float) {
-        prefs.edit().putFloat(KEY_SPEED, speed.coerceIn(0.5f, 2.0f)).apply()
+        prefs.edit().putFloat(KEY_SPEED, speed.coerceIn(0.65f, 1.8f)).apply()
     }
 
     fun updateFontSize(size: Float) {
         prefs.edit().putFloat(KEY_FONT_SIZE, size.coerceIn(14f, 36f)).apply()
+    }
+
+    fun updateRolesEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_ROLES, enabled).apply()
+    }
+
+    fun updateNarratorSid(sid: Int) {
+        prefs.edit().putInt(KEY_NARRATOR_SID, sid.coerceIn(0, 9)).apply()
     }
 
     companion object {
@@ -61,5 +73,7 @@ class ReaderStore(private val context: Context) {
         private const val KEY_OFFSET = "offset"
         private const val KEY_SPEED = "speed"
         private const val KEY_FONT_SIZE = "font_size"
+        private const val KEY_ROLES = "roles_enabled"
+        private const val KEY_NARRATOR_SID = "narrator_sid"
     }
 }

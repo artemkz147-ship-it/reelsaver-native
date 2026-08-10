@@ -20,11 +20,11 @@ import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsSupertonicModelConfig
-import kotlin.math.abs
 import kotlin.math.max
 
 class TtsPlaybackService : Service() {
     private lateinit var store: ReaderStore
+    private lateinit var russianProsody: RussianProsody
 
     @Volatile private var generation = 0
     @Volatile private var paused = false
@@ -40,6 +40,7 @@ class TtsPlaybackService : Service() {
     override fun onCreate() {
         super.onCreate()
         store = ReaderStore(this)
+        russianProsody = RussianProsody(this)
         createChannel()
     }
 
@@ -49,8 +50,7 @@ class TtsPlaybackService : Service() {
         try {
             when (intent?.action ?: ACTION_PLAY) {
                 ACTION_PLAY -> {
-                    val saved = store.loadBook()
-                    if (saved != null) {
+                    store.loadBook()?.let { saved ->
                         val offset = intent?.getIntExtra(EXTRA_OFFSET, saved.offset) ?: saved.offset
                         startPlayback(offset)
                     }
@@ -63,8 +63,7 @@ class TtsPlaybackService : Service() {
                     else store.loadBook()?.let { startPlayback(it.offset) }
                 }
                 ACTION_SEEK -> {
-                    val saved = store.loadBook()
-                    if (saved != null) {
+                    store.loadBook()?.let { saved ->
                         val delta = intent?.getIntExtra(EXTRA_DELTA, 0) ?: 0
                         startPlayback((saved.offset + delta).coerceAtLeast(0))
                     }
@@ -92,48 +91,52 @@ class TtsPlaybackService : Service() {
         playing = true
         stopTrack()
 
-        startForeground(NOTIFICATION_ID, makeNotification("Запускаю художественную озвучку…", true))
+        startForeground(NOTIFICATION_ID, makeNotification("Запускаю живое чтение…", true))
         broadcastState(offset, true, null)
 
         Thread({
             try {
                 val engine = ensureTts()
-                val saved = store.loadBook()
-                val rolesEnabled = saved?.rolesEnabled ?: true
-                val narratorSid = saved?.narratorSid ?: 0
+                val narratorSid = store.loadBook()?.narratorSid ?: 0
                 var position = offset
 
                 while (myGeneration == generation && position < text.length) {
                     waitWhilePaused(myGeneration)
                     if (myGeneration != generation) break
 
-                    val utterance = nextUtterance(
-                        full = text,
-                        start = position,
-                        rolesEnabled = rolesEnabled,
-                        narratorSid = narratorSid
-                    ) ?: break
-
+                    val utterance = nextUtterance(text, position, narratorSid) ?: break
                     currentRangeStart = utterance.start
                     currentRangeEnd = utterance.end
-                    currentSpeaker = utterance.sid
-                    broadcastState(utterance.start, true, null, utterance.start, utterance.end, utterance.sid)
-                    updateNotification(
-                        if (utterance.sid == narratorSid) "Читает рассказчик" else "Диалог · голос ${utterance.sid + 1}",
-                        true
-                    )
+                    currentSpeaker = narratorSid
 
-                    val speed = store.loadBook()?.speed ?: 1.0f
+                    broadcastState(
+                        utterance.start,
+                        true,
+                        null,
+                        utterance.start,
+                        utterance.end,
+                        narratorSid
+                    )
+                    updateNotification("Живое чтение · ударения и паузы", true)
+
+                    val baseSpeed = store.loadBook()?.speed ?: 1.0f
                     synchronized(ttsLock) {
                         if (myGeneration == generation) {
-                            streamUtterance(engine, utterance, speed, myGeneration)
+                            streamUtterance(engine, utterance, baseSpeed, myGeneration)
                         }
                     }
                     if (myGeneration != generation) break
 
                     position = utterance.end
                     store.updateOffset(position)
-                    broadcastState(position, true, null, utterance.start, utterance.end, utterance.sid)
+                    broadcastState(
+                        position,
+                        true,
+                        null,
+                        utterance.start,
+                        utterance.end,
+                        narratorSid
+                    )
                     playPause(utterance.pauseMs, myGeneration)
                 }
 
@@ -151,11 +154,7 @@ class TtsPlaybackService : Service() {
                     playing = false
                     paused = false
                     val message = safeMessage(t)
-                    broadcastState(
-                        store.loadBook()?.offset ?: offset,
-                        false,
-                        "Ошибка озвучки: $message"
-                    )
+                    broadcastState(store.loadBook()?.offset ?: offset, false, "Ошибка озвучки: $message")
                     getSystemService(NotificationManager::class.java)
                         .notify(NOTIFICATION_ID, makeNotification("Ошибка озвучки", false))
                     stopForeground(STOP_FOREGROUND_DETACH)
@@ -178,7 +177,9 @@ class TtsPlaybackService : Service() {
             "$modelDir/unicode_indexer.bin",
             "$modelDir/voice.bin"
         )
-        required.forEach { assets.open(it).use { input -> require(input.read() >= 0) { "Нет файла модели: $it" } } }
+        required.forEach { path ->
+            assets.open(path).use { input -> require(input.read() >= 0) { "Нет файла модели: $path" } }
+        }
 
         val supertonic = OfflineTtsSupertonicModelConfig(
             durationPredictor = "$modelDir/duration_predictor.int8.onnx",
@@ -198,12 +199,12 @@ class TtsPlaybackService : Service() {
                 provider = "cpu"
             ),
             maxNumSentences = 1,
-            silenceScale = 0.28f
+            silenceScale = 0.30f
         )
 
         OfflineTts(assetManager = assets, config = config).also { engine ->
             require(engine.sampleRate() > 0) { "Неверная частота Supertonic" }
-            require(engine.numSpeakers() >= 2) { "В модели нет нескольких голосов" }
+            require(engine.numSpeakers() >= 1) { "В модели нет голоса" }
             tts = engine
         }
     }
@@ -213,45 +214,44 @@ class TtsPlaybackService : Service() {
         val end: Int,
         val text: String,
         val sid: Int,
-        val pauseMs: Int
+        val pauseMs: Int,
+        val speedFactor: Float,
+        val silenceScale: Float
     )
 
-    private fun nextUtterance(
-        full: String,
-        start: Int,
-        rolesEnabled: Boolean,
-        narratorSid: Int
-    ): Utterance? {
+    private fun nextUtterance(full: String, start: Int, narratorSid: Int): Utterance? {
         var from = start.coerceIn(0, full.length)
         while (from < full.length && full[from].isWhitespace()) from++
         if (from >= full.length) return null
 
-        val hard = (from + 520).coerceAtMost(full.length)
-        val minBoundary = (from + 35).coerceAtMost(hard)
+        val hard = (from + 620).coerceAtMost(full.length)
+        val minBoundary = (from + 45).coerceAtMost(hard)
         var end = hard
+        var softClause = -1
         var i = minBoundary
 
         while (i < hard) {
             val c = full[i]
-            val sentenceEnd = c == '.' || c == '!' || c == '?' || c == '…'
-            if (sentenceEnd) {
+            if (c == '.' || c == '!' || c == '?' || c == '…') {
                 var candidate = i + 1
-                while (candidate < hard && (full[candidate] == '"' || full[candidate] == '»' || full[candidate] == '”')) {
-                    candidate++
-                }
+                while (candidate < hard && full[candidate] in charArrayOf('"', '»', '”', '’')) candidate++
                 end = candidate
                 break
             }
-            if (c == '\n' && i > from + 70) {
+            if (c == '\n' && i > from + 60) {
                 end = i
                 break
+            }
+            if ((c == ';' || c == ':') && i > from + 180 && softClause < 0) {
+                softClause = i + 1
             }
             i++
         }
 
+        if (end == hard && softClause > 0) end = softClause
         if (end == hard && hard < full.length) {
             var back = hard
-            while (back > from + 120) {
+            while (back > from + 140) {
                 if (full[back - 1].isWhitespace()) {
                     end = back
                     break
@@ -262,61 +262,59 @@ class TtsPlaybackService : Service() {
         if (end <= from) end = (from + 1).coerceAtMost(full.length)
 
         val raw = full.substring(from, end)
-        val spoken = prepareSpeech(raw)
-        if (spoken.isBlank()) return nextUtterance(full, end, rolesEnabled, narratorSid)
+        val paragraphBefore = from > 1 && full.substring((from - 3).coerceAtLeast(0), from).count { it == '\n' } >= 2
+        var spoken = russianProsody.prepare(raw)
+        if (spoken.isBlank()) return nextUtterance(full, end, narratorSid)
 
-        val lineStart = (full.lastIndexOf('\n', from - 1) + 1).coerceAtLeast(0)
-        val lineEndIndex = full.indexOf('\n', from)
-        val lineEnd = if (lineEndIndex >= 0) lineEndIndex else full.length
-        val lineText = full.substring(lineStart, minOf(lineEnd, lineStart + 500)).trim()
+        // Supertonic 3 supports expression tags. A breath only at a new paragraph
+        // sounds much more natural than injecting it into every sentence.
+        if (paragraphBefore && spoken.length > 35) spoken = "<breath> $spoken"
 
-        val speakerName = Regex("^([А-ЯЁA-Z][А-Яа-яЁёA-Za-z-]{1,28})\\s*:")
-            .find(lineText)?.groupValues?.getOrNull(1)
-        val isDashDialogue = lineText.startsWith("—") || lineText.startsWith("–") || lineText.startsWith("-")
-        val isQuotedDialogue = lineText.startsWith("«") || lineText.startsWith("\"")
-        val isDialogue = rolesEnabled && (speakerName != null || isDashDialogue || isQuotedDialogue)
-
-        val sid = if (!isDialogue) {
-            narratorSid
-        } else {
-            val key = speakerName?.lowercase() ?: lineText.take(120).lowercase()
-            chooseDialogueSid(key, narratorSid)
-        }
-
-        val after = full.substring(end, minOf(full.length, end + 3))
+        val trimmed = raw.trimEnd()
+        val after = full.substring(end, minOf(full.length, end + 4))
         val pauseMs = when {
-            after.startsWith("\n\n") -> 380
-            after.startsWith("\n") -> 260
-            raw.trimEnd().endsWith("!") || raw.trimEnd().endsWith("?") -> 230
-            raw.trimEnd().endsWith("…") -> 300
-            raw.trimEnd().endsWith(":") -> 150
-            else -> 135
+            after.startsWith("\n\n") -> 520
+            after.startsWith("\n") -> 330
+            trimmed.endsWith("…") -> 390
+            trimmed.endsWith("?") -> 300
+            trimmed.endsWith("!") -> 270
+            trimmed.endsWith(":") -> 200
+            trimmed.endsWith(";") -> 185
+            else -> 155
         }
 
-        return Utterance(from, end, spoken, sid, pauseMs)
-    }
+        val commas = raw.count { it == ',' }
+        val speedFactor = when {
+            trimmed.endsWith("…") -> 0.90f
+            trimmed.endsWith("?") -> 0.94f
+            trimmed.endsWith("!") -> 1.02f
+            raw.length < 55 -> 0.95f
+            commas >= 3 -> 0.96f
+            else -> 1.0f
+        }
+        val silenceScale = when {
+            trimmed.endsWith("…") -> 0.42f
+            trimmed.endsWith("?") -> 0.36f
+            trimmed.endsWith("!") -> 0.32f
+            commas >= 3 -> 0.34f
+            else -> 0.29f
+        }
 
-    private fun chooseDialogueSid(key: String, narratorSid: Int): Int {
-        val preferred = intArrayOf(2, 5, 7, 9, 3, 6, 1, 4, 8)
-        val index = abs(key.hashCode()).let { if (it == Int.MIN_VALUE) 0 else it } % preferred.size
-        var sid = preferred[index]
-        if (sid == narratorSid) sid = preferred[(index + 1) % preferred.size]
-        return sid.coerceIn(0, 9)
-    }
-
-    private fun prepareSpeech(text: String): String {
-        return text
-            .replace('\u00A0', ' ')
-            .replace(Regex("[ \\t]+"), " ")
-            .replace(Regex("\\n{2,}"), " … ")
-            .replace(Regex("\\s*—\\s*"), " — ")
-            .trim()
+        return Utterance(
+            start = from,
+            end = end,
+            text = spoken,
+            sid = narratorSid,
+            pauseMs = pauseMs,
+            speedFactor = speedFactor,
+            silenceScale = silenceScale
+        )
     }
 
     private fun streamUtterance(
         engine: OfflineTts,
         utterance: Utterance,
-        speed: Float,
+        baseSpeed: Float,
         myGeneration: Int
     ) {
         val sampleRate = engine.sampleRate()
@@ -327,14 +325,16 @@ class TtsPlaybackService : Service() {
         var lastProgressAt = 0L
         var lastSavedAt = 0L
 
-        val estimatedSeconds = max(0.75, utterance.text.length.toDouble() / (13.5 * speed.coerceAtLeast(0.65f)))
+        val effectiveSpeed = (baseSpeed * utterance.speedFactor).coerceIn(0.70f, 1.60f)
+        val visibleLength = utterance.text.replace(Regex("<[^>]+>"), "").length.coerceAtLeast(1)
+        val estimatedSeconds = max(0.75, visibleLength.toDouble() / (13.2 * effectiveSpeed))
         val estimatedSamples = max(sampleRate.toDouble() * estimatedSeconds, sampleRate * 0.5)
 
         val config = GenerationConfig(
-            silenceScale = 0.30f,
-            speed = speed,
+            silenceScale = utterance.silenceScale,
+            speed = effectiveSpeed,
             sid = utterance.sid,
-            numSteps = 8,
+            numSteps = 10,
             extra = mapOf("lang" to "ru")
         )
 
@@ -465,7 +465,7 @@ class TtsPlaybackService : Service() {
         }
         paused = false
         runCatching { currentTrack?.play() }
-        updateNotification("Читаю вслух", true)
+        updateNotification("Живое чтение", true)
         broadcastState(
             store.loadBook()?.offset ?: 0,
             true,
@@ -488,6 +488,7 @@ class TtsPlaybackService : Service() {
 
     private fun stopTrack() {
         val track = currentTrack ?: return
+        currentTrack = null
         runCatching { track.pause() }
         runCatching { track.flush() }
         runCatching { track.stop() }
@@ -500,7 +501,7 @@ class TtsPlaybackService : Service() {
                 "Озвучка книг",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Управление художественной озвучкой книги"
+                description = "Живое чтение книги с синхронизацией текста"
                 setSound(null, null)
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -569,9 +570,8 @@ class TtsPlaybackService : Service() {
         })
     }
 
-    private fun safeMessage(t: Throwable): String {
-        return t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
-    }
+    private fun safeMessage(t: Throwable): String =
+        t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
 
     override fun onDestroy() {
         generation += 1

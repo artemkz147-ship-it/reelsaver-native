@@ -2,16 +2,29 @@ package com.artem.neuroreader
 
 import android.content.Context
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Lightweight offline Russian text preprocessor for TTS.
+ * Offline Russian text preprocessor for TTS.
  *
- * The large base dictionary is downloaded at build time from StressRNN
- * (Apache-2.0) into assets/tts/ru-stress-dict.txt. The preprocessor is
- * deliberately independent of Python/PyTorch so it works inside the APK.
+ * The large stress dictionary lives in APK assets. It is warmed in a background
+ * thread so the first spoken phrase never blocks on parsing tens of thousands
+ * of entries. Until it is ready, common stresses + contextual homographs work.
  */
-class RussianProsody(context: Context) {
-    private val stressMap: Map<String, String> by lazy { loadStressDictionary(context) }
+class RussianProsody(private val context: Context) {
+    @Volatile private var stressMap: Map<String, String>? = null
+    private val warming = AtomicBoolean(false)
+
+    fun warmUpAsync() {
+        if (stressMap != null || !warming.compareAndSet(false, true)) return
+        Thread({
+            try {
+                stressMap = loadStressDictionary()
+            } finally {
+                warming.set(false)
+            }
+        }, "NeuroReader-StressDict").start()
+    }
 
     fun prepare(text: String): String {
         val normalized = text
@@ -20,130 +33,225 @@ class RussianProsody(context: Context) {
             .trim()
 
         if (normalized.isBlank()) return normalized
+
         val withYo = restoreCommonYo(normalized)
         val withContext = applyContextHomographs(withYo)
-        return applyDictionaryStress(withContext)
+        val dictionary = stressMap
+        return if (dictionary != null) {
+            applyDictionaryStress(withContext, dictionary)
+        } else {
+            applyFallbackStress(withContext)
+        }
     }
 
-    private fun loadStressDictionary(context: Context): Map<String, String> {
-        val result = HashMap<String, String>(65_536)
+    private fun loadStressDictionary(): Map<String, String> {
+        val result = HashMap<String, String>(110_000)
+
         runCatching {
-            context.assets.open("tts/ru-stress-dict.txt").bufferedReader(Charsets.UTF_8).useLines { lines ->
-                lines.forEach { raw ->
-                    val value = raw.trim()
-                    if (value.isEmpty() || value.startsWith("#") || value.startsWith(";")) return@forEach
-                    if ('+' !in value && '\'' !in value) return@forEach
-                    val accented = value
-                        .replace("'", "+")
-                        .let(::plusToAcute)
-                    val key = accented.replace("\u0301", "").lowercase(Locale.ROOT)
-                    if (key.length >= 3 && key.none { it.isWhitespace() }) {
-                        result.putIfAbsent(key, accented)
+            context.assets.open("tts/ru-stress-dict.txt")
+                .bufferedReader(Charsets.UTF_8)
+                .useLines { lines ->
+                    lines.forEach { raw ->
+                        val value = raw.trim()
+                        if (value.isEmpty() || value.startsWith("#") || value.startsWith(";")) {
+                            return@forEach
+                        }
+                        if ('+' !in value && '\'' !in value) return@forEach
+
+                        val accented = plusToAcute(value.replace("'", "+"))
+                        val key = accented
+                            .replace("\u0301", "")
+                            .lowercase(Locale.ROOT)
+
+                        if (
+                            key.length >= 3 &&
+                            key.none { it.isWhitespace() } &&
+                            key.any { it in "аеёиоуыэюя" }
+                        ) {
+                            result.putIfAbsent(key, accented)
+                        }
                     }
                 }
-            }
         }
 
-        // High-frequency fallback words; also useful if an external dictionary
-        // changes format or is unavailable during a local development build.
-        fallbackStress.forEach { (plain, accented) -> result.putIfAbsent(plain, accented) }
+        fallbackStress.forEach { (plain, accented) ->
+            result.putIfAbsent(plain, accented)
+        }
         return result
     }
 
-    private fun applyDictionaryStress(text: String): String {
-        val word = Regex("[А-Яа-яЁё-]{3,}")
-        return word.replace(text) { match ->
+    private fun applyDictionaryStress(
+        text: String,
+        dictionary: Map<String, String>
+    ): String {
+        return russianWord.replace(text) { match ->
             val original = match.value
-            if (original.any { it == '\u0301' }) return@replace original
             val key = original.lowercase(Locale.ROOT)
-            val accented = stressMap[key] ?: return@replace original
+            val accented = dictionary[key] ?: return@replace original
+            preserveCase(original, accented)
+        }
+    }
+
+    private fun applyFallbackStress(text: String): String {
+        return russianWord.replace(text) { match ->
+            val original = match.value
+            val accented = fallbackStress[original.lowercase(Locale.ROOT)]
+                ?: return@replace original
             preserveCase(original, accented)
         }
     }
 
     private fun applyContextHomographs(text: String): String {
         var out = text
+
         out = replaceHomograph(out, "замок") { ctx ->
-            if (ctx.hasAny("ключ", "двер", "запер", "отпер", "закры", "откры", "скваж", "сломан")) "замо́к" else "за́мок"
+            if (ctx.hasAny("ключ", "двер", "запер", "отпер", "закры", "откры", "скваж", "засов")) {
+                "замо́к"
+            } else {
+                "за́мок"
+            }
         }
+
         out = replaceHomograph(out, "мука") { ctx ->
-            if (ctx.hasAny("хлеб", "тесто", "пшен", "ржан", "мешок", "килограмм", "просе")) "мука́" else "му́ка"
+            if (ctx.hasAny("хлеб", "тесто", "пшен", "ржан", "мешок", "килограмм", "просе", "выпеч")) {
+                "мука́"
+            } else {
+                "му́ка"
+            }
         }
+
         out = replaceHomograph(out, "духи") { ctx ->
-            if (ctx.hasAny("флакон", "запах", "аромат", "парфюм", "надуш", "одеколон")) "духи́" else "ду́хи"
+            if (ctx.hasAny("флакон", "запах", "аромат", "парфюм", "надуш", "одеколон")) {
+                "духи́"
+            } else {
+                "ду́хи"
+            }
         }
+
         out = replaceHomograph(out, "атлас") { ctx ->
-            if (ctx.hasAny("ткан", "шелк", "шёлк", "плать", "лента")) "атла́с" else "а́тлас"
+            if (ctx.hasAny("ткан", "шелк", "шёлк", "плать", "лента", "материал")) {
+                "атла́с"
+            } else {
+                "а́тлас"
+            }
         }
+
         out = replaceHomograph(out, "орган") { ctx ->
-            if (ctx.hasAny("музык", "клавиш", "собор", "концерт", "играл")) "орга́н" else "о́рган"
+            if (ctx.hasAny("музык", "клавиш", "собор", "концерт", "играл", "мелод")) {
+                "орга́н"
+            } else {
+                "о́рган"
+            }
         }
+
         out = replaceHomograph(out, "ирис") { ctx ->
-            if (ctx.hasAny("конфет", "слад", "жеватель", "сливоч")) "ири́с" else "и́рис"
+            if (ctx.hasAny("конфет", "слад", "жеватель", "сливоч")) {
+                "ири́с"
+            } else {
+                "и́рис"
+            }
         }
+
         out = replaceHomograph(out, "хлопок") { ctx ->
-            if (ctx.hasAny("ткан", "поле", "сырь", "волокн", "урожай")) "хлопо́к" else "хло́пок"
+            if (ctx.hasAny("ткан", "поле", "сырь", "волокн", "урожай")) {
+                "хлопо́к"
+            } else {
+                "хло́пок"
+            }
         }
+
         out = replaceHomograph(out, "кружки") { ctx ->
-            if (ctx.hasAny("секци", "занят", "дворец", "школь", "творче")) "кружки́" else "кру́жки"
+            if (ctx.hasAny("секци", "занят", "дворец", "школь", "творче")) {
+                "кружки́"
+            } else {
+                "кру́жки"
+            }
         }
+
         out = replaceHomograph(out, "плачу") { ctx ->
-            if (ctx.hasAny("деньг", "рубл", "счёт", "счет", "покуп", "налог", "цен")) "плачу́" else "пла́чу"
+            if (ctx.hasAny("деньг", "рубл", "счёт", "счет", "покуп", "налог", "цен")) {
+                "плачу́"
+            } else {
+                "пла́чу"
+            }
         }
+
         out = replaceHomograph(out, "стоит") { ctx ->
-            if (ctx.hasAny("рубл", "цен", "доллар", "евро", "сколько", "дорог", "дешев")) "сто́ит" else "стои́т"
+            if (ctx.hasAny("рубл", "цен", "доллар", "евро", "сколько", "дорог", "дешев")) {
+                "сто́ит"
+            } else {
+                "стои́т"
+            }
         }
+
         out = replaceHomograph(out, "уже") { ctx ->
-            if (ctx.hasAny("чем", "шир", "коридор", "проход", "талия")) "у́же" else "уже́"
+            if (ctx.hasAny("чем", "шир", "коридор", "проход", "талия")) {
+                "у́же"
+            } else {
+                "уже́"
+            }
         }
+
         return out
     }
 
-    private fun replaceHomograph(text: String, plain: String, choose: (String) -> String): String {
-        val regex = Regex("(?iu)(?<![А-Яа-яЁё])${Regex.escape(plain)}(?![А-Яа-яЁё])")
-        return regex.replace(text) { m ->
-            val left = (m.range.first - 55).coerceAtLeast(0)
-            val right = (m.range.last + 56).coerceAtMost(text.length)
-            val context = text.substring(left, right).lowercase(Locale.ROOT)
-            preserveCase(m.value, choose(context))
+    private fun replaceHomograph(
+        text: String,
+        plain: String,
+        choose: (String) -> String
+    ): String {
+        val regex = Regex(
+            "(?iu)(?<![А-Яа-яЁё])${Regex.escape(plain)}(?![А-Яа-яЁё])"
+        )
+        return regex.replace(text) { match ->
+            val left = (match.range.first - 60).coerceAtLeast(0)
+            val right = (match.range.last + 61).coerceAtMost(text.length)
+            val nearby = text.substring(left, right).lowercase(Locale.ROOT)
+            preserveCase(match.value, choose(nearby))
         }
     }
 
     private fun restoreCommonYo(text: String): String {
         var out = text
         commonYo.forEach { (plain, correct) ->
-            val regex = Regex("(?iu)(?<![А-Яа-яЁё])${Regex.escape(plain)}(?![А-Яа-яЁё])")
+            val regex = Regex(
+                "(?iu)(?<![А-Яа-яЁё])${Regex.escape(plain)}(?![А-Яа-яЁё])"
+            )
             out = regex.replace(out) { preserveCase(it.value, correct) }
         }
         return out
     }
 
     private fun plusToAcute(value: String): String {
-        val b = StringBuilder(value.length + 2)
-        var i = 0
-        while (i < value.length) {
-            val c = value[i]
-            if (c == '+' && b.isNotEmpty()) {
-                b.append('\u0301')
+        val builder = StringBuilder(value.length + 2)
+        for (char in value) {
+            if (char == '+' && builder.isNotEmpty()) {
+                builder.append('\u0301')
             } else {
-                b.append(c)
+                builder.append(char)
             }
-            i++
         }
-        return b.toString()
+        return builder.toString()
     }
 
     private fun preserveCase(source: String, target: String): String {
-        if (source.all { !it.isLetter() || it.isUpperCase() }) return target.uppercase(Locale.ROOT)
+        if (source.all { !it.isLetter() || it.isUpperCase() }) {
+            return target.uppercase(Locale.ROOT)
+        }
         if (source.firstOrNull()?.isUpperCase() == true) {
-            return target.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+            return target.replaceFirstChar {
+                if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString()
+            }
         }
         return target
     }
 
-    private fun String.hasAny(vararg fragments: String): Boolean = fragments.any { contains(it) }
+    private fun String.hasAny(vararg fragments: String): Boolean =
+        fragments.any { contains(it) }
 
     companion object {
+        private val russianWord = Regex("[А-Яа-яЁё-]{3,}")
+
         private val commonYo = linkedMapOf(
             "еще" to "ещё",
             "ее" to "её",
@@ -162,9 +270,8 @@ class RussianProsody(context: Context) {
             "черный" to "чёрный",
             "черная" to "чёрная",
             "черное" to "чёрное",
-            "черт" to "чёрт",
-            "чем" to "чем" // marker keeps map non-empty after generated filtering
-        ).filterKeys { it != "чем" }
+            "черт" to "чёрт"
+        )
 
         private val fallbackStress = mapOf(
             "красивее" to "краси́вее",

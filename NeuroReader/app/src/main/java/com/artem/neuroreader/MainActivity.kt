@@ -11,11 +11,18 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.text.Layout
+import android.text.SpannableString
+import android.text.Spanned
 import android.text.StaticLayout
 import android.text.TextPaint
+import android.text.style.BackgroundColorSpan
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.FrameLayout
@@ -29,25 +36,32 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Job
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
     private lateinit var store: ReaderStore
     private lateinit var root: LinearLayout
+    private lateinit var topChrome: LinearLayout
+    private lateinit var bottomChrome: LinearLayout
     private lateinit var titleView: TextView
+    private lateinit var pageFrame: FrameLayout
     private lateinit var pageView: TextView
     private lateinit var pageInfo: TextView
+    private lateinit var audioInfo: TextView
     private lateinit var seekBar: SeekBar
     private lateinit var speedButton: Button
     private lateinit var playButton: Button
+    private lateinit var rolesButton: Button
+    private lateinit var voiceButton: Button
 
-    private var currentText: String = ""
+    private var currentText = ""
     private var pages: List<Int> = listOf(0)
     private var currentPage = 0
     private var changingSeek = false
@@ -57,6 +71,15 @@ class MainActivity : AppCompatActivity() {
     private var lastPageHeight = 0
     private var audioSessionActive = false
     private var audioPaused = false
+    private var highlightStart = -1
+    private var highlightEnd = -1
+    private var audioCursor = -1
+    private var currentSpeaker = -1
+    private var lastHighlightRenderAt = 0L
+    private var chromeVisible = true
+    private var animatingPage = false
+    private var downX = 0f
+    private var downY = 0f
 
     private val openBook = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) importBook(uri)
@@ -71,22 +94,34 @@ class MainActivity : AppCompatActivity() {
                 .coerceIn(0, currentText.length.coerceAtLeast(0))
             audioSessionActive = intent.getBooleanExtra(TtsPlaybackService.EXTRA_IS_PLAYING, false)
             audioPaused = intent.getBooleanExtra(TtsPlaybackService.EXTRA_PAUSED, false)
+            highlightStart = intent.getIntExtra(TtsPlaybackService.EXTRA_RANGE_START, -1)
+            highlightEnd = intent.getIntExtra(TtsPlaybackService.EXTRA_RANGE_END, -1)
+            currentSpeaker = intent.getIntExtra(TtsPlaybackService.EXTRA_SPEAKER_ID, -1)
+            audioCursor = if (audioSessionActive) offset else -1
+
             playButton.text = if (audioSessionActive && !audioPaused) "Ⅱ" else "▶"
+            audioInfo.text = when {
+                audioSessionActive && audioPaused -> "Пауза · продолжайте глазами с этого места"
+                audioSessionActive && currentSpeaker >= 0 -> "Аудио · голос ${currentSpeaker + 1} · синхронизация включена"
+                else -> "Текст · ▶ продолжит голосом с текущего места"
+            }
 
             if (currentText.isNotEmpty()) {
-                store.updateOffset(offset)
                 val newPage = findPageForOffset(offset)
+                val now = SystemClock.elapsedRealtime()
                 if (newPage != currentPage) {
                     currentPage = newPage
                     renderCurrentPage(saveOffset = false)
+                    lastHighlightRenderAt = now
+                } else if (now - lastHighlightRenderAt >= 110L) {
+                    renderCurrentPage(saveOffset = false)
+                    lastHighlightRenderAt = now
                 }
                 updateChrome(offset)
             }
 
             val error = intent.getStringExtra(TtsPlaybackService.EXTRA_ERROR)
-            if (!error.isNullOrBlank()) {
-                Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
-            }
+            if (!error.isNullOrBlank()) Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -95,6 +130,10 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = true
+            isAppearanceLightNavigationBars = true
+        }
 
         store = ReaderStore(this)
         buildUi()
@@ -119,7 +158,7 @@ class MainActivity : AppCompatActivity() {
     private fun buildUi() {
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.rgb(226, 222, 211))
+            setBackgroundColor(Color.rgb(225, 221, 210))
         }
 
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
@@ -135,64 +174,74 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        val header = LinearLayout(this).apply {
+        topChrome = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(2), dp(2), dp(2), dp(4))
+            setPadding(dp(2), dp(2), dp(2), dp(5))
         }
 
-        val open = Button(this).apply {
-            text = "＋ Книга"
-            isAllCaps = false
-            minWidth = 0
-            minimumWidth = 0
-            setOnClickListener { openBook.launch(arrayOf("*/*")) }
-        }
-
+        val open = flatButton("Книга") { openBook.launch(arrayOf("*/*")) }
         titleView = TextView(this).apply {
             text = "НейроЧиталка"
             textSize = 17f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.rgb(45, 43, 39))
-            maxLines = 2
+            setTextColor(Color.rgb(42, 40, 36))
+            maxLines = 1
             setPadding(dp(10), 0, dp(4), 0)
         }
 
-        header.addView(
-            open,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        )
-        header.addView(
-            titleView,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        )
-        root.addView(header)
+        topChrome.addView(open, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)))
+        topChrome.addView(titleView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(topChrome)
 
-        val pageFrame = FrameLayout(this).apply {
-            setPadding(dp(3), dp(2), dp(3), dp(2))
+        pageFrame = FrameLayout(this).apply {
+            setPadding(dp(2), dp(1), dp(2), dp(1))
+            isClickable = true
+            isFocusable = true
         }
 
         pageView = TextView(this).apply {
             textSize = store.loadBook()?.fontSize ?: 20f
-            setTextColor(Color.rgb(39, 37, 33))
-            setPadding(dp(20), dp(18), dp(20), dp(18))
-            setLineSpacing(0f, 1.24f)
+            setTextColor(Color.rgb(38, 36, 32))
+            setPadding(dp(22), dp(20), dp(22), dp(20))
+            setLineSpacing(0f, LINE_SPACING)
             gravity = Gravity.TOP or Gravity.START
             includeFontPadding = false
+            breakStrategy = Layout.BREAK_STRATEGY_HIGH_QUALITY
+            hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NORMAL
             background = GradientDrawable().apply {
-                setColor(Color.rgb(248, 244, 232))
-                cornerRadius = dp(14).toFloat()
+                setColor(Color.rgb(250, 247, 237))
+                cornerRadius = dp(12).toFloat()
             }
             elevation = dp(3).toFloat()
-            text = "Нажмите «＋ Книга» и выберите книгу.\n\nТекст будет показан постранично, а место чтения сохранится автоматически."
-            setOnTouchListener { view, event ->
-                if (event.action == MotionEvent.ACTION_UP && currentText.isNotEmpty()) {
-                    when {
-                        event.x < view.width * 0.34f -> turnPage(-1)
-                        event.x > view.width * 0.66f -> turnPage(1)
-                    }
+            text = "Откройте книгу.\n\nЛистайте свайпом влево и вправо. Тап по центру скрывает панели. Голос и текст всегда используют одну позицию."
+        }
+
+        pageFrame.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    true
                 }
-                true
+                MotionEvent.ACTION_UP -> {
+                    if (currentText.isEmpty()) return@setOnTouchListener true
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    val swipeThreshold = maxOf(dp(52).toFloat(), view.width * 0.12f)
+                    if (abs(dx) >= swipeThreshold && abs(dx) > abs(dy) * 1.15f) {
+                        turnPage(if (dx < 0f) 1 else -1, animated = true)
+                    } else {
+                        when {
+                            event.x < view.width * 0.27f -> turnPage(-1, animated = true)
+                            event.x > view.width * 0.73f -> turnPage(1, animated = true)
+                            else -> toggleChromeVisibility()
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> true
+                else -> true
             }
         }
 
@@ -216,14 +265,27 @@ class MainActivity : AppCompatActivity() {
         )
         root.addView(pageFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
+        bottomChrome = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(3), 0, 0)
+        }
+
         pageInfo = TextView(this).apply {
             text = "—"
-            textSize = 13f
+            textSize = 12.5f
             gravity = Gravity.CENTER
-            setTextColor(Color.rgb(82, 78, 69))
-            setPadding(dp(4), dp(2), dp(4), 0)
+            setTextColor(Color.rgb(87, 82, 72))
         }
-        root.addView(pageInfo)
+        bottomChrome.addView(pageInfo)
+
+        audioInfo = TextView(this).apply {
+            text = "Текст · ▶ продолжит голосом с текущего места"
+            textSize = 11.5f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(104, 93, 72))
+            setPadding(dp(4), dp(1), dp(4), dp(1))
+        }
+        bottomChrome.addView(audioInfo)
 
         seekBar = SeekBar(this).apply {
             max = 10_000
@@ -242,37 +304,56 @@ class MainActivity : AppCompatActivity() {
                         .toInt()
                         .coerceIn(0, currentText.length)
                     currentPage = findPageForOffset(target)
+                    highlightStart = -1
+                    highlightEnd = -1
+                    audioCursor = -1
                     renderCurrentPage(saveOffset = true)
-                    if (audioSessionActive) playFromOffset(pageStart(currentPage))
+                    handleManualPositionChange(pageStart(currentPage))
                 }
             })
         }
-        root.addView(
-            seekBar,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        )
+        bottomChrome.addView(seekBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(32)))
 
-        val controls = LinearLayout(this).apply {
+        val mainControls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(1))
         }
-
-        controls.addView(controlButton("A−") { changeFont(-2f) }, weighted())
-        controls.addView(controlButton("‹") { turnPage(-1) }, weighted())
+        mainControls.addView(controlButton("‹") { turnPage(-1, animated = true) }, weighted())
+        mainControls.addView(controlButton("A−") { changeFont(-1.5f) }, weighted())
         playButton = controlButton("▶") { togglePlayback() }
-        controls.addView(playButton, weighted(1.15f))
-        controls.addView(controlButton("›") { turnPage(1) }, weighted())
-        controls.addView(controlButton("A+") { changeFont(2f) }, weighted())
-        speedButton = controlButton("1.0×") { cycleSpeed() }
-        controls.addView(speedButton, weighted(1.05f))
-        root.addView(
-            controls,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        )
+        playButton.textSize = 20f
+        mainControls.addView(playButton, weighted(1.25f))
+        mainControls.addView(controlButton("A+") { changeFont(1.5f) }, weighted())
+        mainControls.addView(controlButton("›") { turnPage(1, animated = true) }, weighted())
+        bottomChrome.addView(mainControls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
+        val audioControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        rolesButton = flatButton("Роли: вкл") { toggleRoles() }
+        voiceButton = flatButton("Рассказчик 1") { cycleNarratorVoice() }
+        speedButton = flatButton("1.0×") { cycleSpeed() }
+        audioControls.addView(rolesButton, weighted(1.25f, 40))
+        audioControls.addView(voiceButton, weighted(1.45f, 40))
+        audioControls.addView(speedButton, weighted(0.9f, 40))
+        bottomChrome.addView(audioControls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        root.addView(bottomChrome)
         setContentView(root)
         ViewCompat.requestApplyInsets(root)
+        refreshSettingsButtons()
+    }
+
+    private fun flatButton(label: String, action: () -> Unit): Button = Button(this).apply {
+        text = label
+        isAllCaps = false
+        minWidth = 0
+        minimumWidth = 0
+        minHeight = 0
+        minimumHeight = 0
+        setPadding(dp(9), 0, dp(9), 0)
+        setOnClickListener { action() }
     }
 
     private fun controlButton(label: String, action: () -> Unit): Button = Button(this).apply {
@@ -280,11 +361,14 @@ class MainActivity : AppCompatActivity() {
         isAllCaps = false
         minWidth = 0
         minimumWidth = 0
+        minHeight = 0
+        minimumHeight = 0
         setPadding(dp(1), 0, dp(1), 0)
         setOnClickListener { action() }
     }
 
-    private fun weighted(weight: Float = 1f) = LinearLayout.LayoutParams(0, dp(50), weight)
+    private fun weighted(weight: Float = 1f, heightDp: Int = 48) =
+        LinearLayout.LayoutParams(0, dp(heightDp), weight)
 
     private fun restoreBook() {
         val book = store.loadBook() ?: return
@@ -296,7 +380,7 @@ class MainActivity : AppCompatActivity() {
         currentText = text
         titleView.text = book.title
         pageView.textSize = book.fontSize
-        speedButton.text = formatSpeed(book.speed)
+        refreshSettingsButtons()
         pageView.post { recalculatePages(book.offset.coerceIn(0, text.length)) }
     }
 
@@ -309,16 +393,15 @@ class MainActivity : AppCompatActivity() {
             }
             result.onSuccess { parsed ->
                 val saved = withContext(Dispatchers.IO) { store.saveBook(parsed.title, parsed.text) }
+                highlightStart = -1
+                highlightEnd = -1
+                audioCursor = -1
                 showBook(saved, parsed.text)
                 Toast.makeText(this@MainActivity, "Книга сохранена", Toast.LENGTH_SHORT).show()
             }.onFailure { error ->
                 titleView.text = store.loadBook()?.title ?: "НейроЧиталка"
                 pageInfo.text = "—"
-                Toast.makeText(
-                    this@MainActivity,
-                    error.message ?: "Не удалось открыть книгу",
-                    Toast.LENGTH_LONG
-                ).show()
+                Toast.makeText(this@MainActivity, error.message ?: "Не удалось открыть книгу", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -327,7 +410,7 @@ class MainActivity : AppCompatActivity() {
         if (currentText.isEmpty()) return
 
         val width = pageView.width - pageView.paddingLeft - pageView.paddingRight
-        val height = pageView.height - pageView.paddingTop - pageView.paddingBottom
+        val height = pageView.height - pageView.paddingTop - pageView.paddingBottom - dp(4)
         if (width <= dp(40) || height <= dp(60)) {
             pageView.post { recalculatePages(requestedOffset) }
             return
@@ -336,13 +419,13 @@ class MainActivity : AppCompatActivity() {
         paginationJob?.cancel()
         val textSnapshot = currentText
         val paint = TextPaint(pageView.paint)
-        pageInfo.text = "Разбиваю на страницы…"
+        pageInfo.text = "Готовлю страницы…"
 
         paginationJob = lifecycleScope.launch {
             val calculated = withContext(Dispatchers.Default) {
                 calculatePageStarts(textSnapshot, paint, width, height)
             }
-            if (textSnapshot !== currentText && textSnapshot != currentText) return@launch
+            if (textSnapshot != currentText) return@launch
             pages = if (calculated.isEmpty()) listOf(0) else calculated
             currentPage = findPageForOffset(requestedOffset.coerceIn(0, currentText.length))
             renderCurrentPage(saveOffset = false)
@@ -350,26 +433,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun calculatePageStarts(
-        text: String,
-        paint: TextPaint,
-        width: Int,
-        height: Int
-    ): List<Int> {
+    private fun calculatePageStarts(text: String, paint: TextPaint, width: Int, height: Int): List<Int> {
         if (text.isEmpty()) return listOf(0)
         val result = ArrayList<Int>()
         var start = 0
 
         while (start < text.length) {
             result.add(start)
-            val probeEnd = (start + 12_000).coerceAtMost(text.length)
+            val probeEnd = (start + 14_000).coerceAtMost(text.length)
             val segment = text.substring(start, probeEnd)
             val layout = StaticLayout.Builder
                 .obtain(segment, 0, segment.length, paint, width)
                 .setAlignment(Layout.Alignment.ALIGN_NORMAL)
                 .setIncludePad(false)
-                .setLineSpacing(0f, 1.24f)
+                .setLineSpacing(0f, LINE_SPACING)
                 .setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY)
+                .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NORMAL)
                 .build()
 
             var lastFitLine = -1
@@ -380,7 +459,14 @@ class MainActivity : AppCompatActivity() {
 
             var relativeEnd = layout.getLineEnd(lastFitLine)
             if (relativeEnd <= 0) relativeEnd = minOf(segment.length, 1)
-            val next = (start + relativeEnd).coerceAtMost(text.length)
+            var next = (start + relativeEnd).coerceAtMost(text.length)
+
+            if (next < text.length && next > start + 20) {
+                var back = next
+                while (back > start + 20 && !text[back - 1].isWhitespace()) back--
+                if (back > start + 20) next = back
+            }
+
             start = if (next > start) next else (start + 1).coerceAtMost(text.length)
         }
         return result
@@ -391,19 +477,95 @@ class MainActivity : AppCompatActivity() {
         currentPage = currentPage.coerceIn(0, pages.lastIndex)
         val start = pageStart(currentPage)
         val end = pageEnd(currentPage)
-        pageView.text = currentText.substring(start, end)
-        pageView.scrollTo(0, 0)
+        val plain = currentText.substring(start, end)
+        val spannable = SpannableString(plain)
+
+        if (audioSessionActive && highlightStart >= 0 && highlightEnd > highlightStart) {
+            val localStart = (highlightStart.coerceAtLeast(start) - start).coerceIn(0, plain.length)
+            val localEnd = (highlightEnd.coerceAtMost(end) - start).coerceIn(0, plain.length)
+            if (localEnd > localStart) {
+                spannable.setSpan(
+                    BackgroundColorSpan(Color.rgb(255, 238, 184)),
+                    localStart,
+                    localEnd,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                )
+                spannable.setSpan(
+                    StyleSpan(Typeface.BOLD),
+                    localStart,
+                    localEnd,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                )
+            }
+            if (audioCursor > highlightStart) {
+                val spokenStart = localStart
+                val spokenEnd = (audioCursor.coerceAtMost(end) - start).coerceIn(localStart, plain.length)
+                if (spokenEnd > spokenStart) {
+                    spannable.setSpan(
+                        ForegroundColorSpan(Color.rgb(151, 91, 20)),
+                        spokenStart,
+                        spokenEnd,
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                }
+            }
+        }
+
+        pageView.text = spannable
         if (saveOffset) store.updateOffset(start)
         updateChrome(if (saveOffset) start else (store.loadBook()?.offset ?: start))
     }
 
-    private fun turnPage(delta: Int) {
-        if (currentText.isEmpty() || pages.isEmpty()) return
-        val next = (currentPage + delta).coerceIn(0, pages.lastIndex)
-        if (next == currentPage) return
-        currentPage = next
-        renderCurrentPage(saveOffset = true)
-        if (audioSessionActive) playFromOffset(pageStart(currentPage))
+    private fun turnPage(delta: Int, animated: Boolean) {
+        if (currentText.isEmpty() || pages.isEmpty() || animatingPage) return
+        val target = (currentPage + delta).coerceIn(0, pages.lastIndex)
+        if (target == currentPage) return
+
+        val commitTurn = {
+            currentPage = target
+            highlightStart = -1
+            highlightEnd = -1
+            audioCursor = -1
+            renderCurrentPage(saveOffset = true)
+            handleManualPositionChange(pageStart(currentPage))
+        }
+
+        if (!animated) {
+            commitTurn()
+            return
+        }
+
+        animatingPage = true
+        val direction = if (delta > 0) -1f else 1f
+        pageView.animate()
+            .translationX(direction * dp(55))
+            .alpha(0.12f)
+            .setDuration(105L)
+            .withEndAction {
+                commitTurn()
+                pageView.translationX = -direction * dp(45)
+                pageView.alpha = 0.12f
+                pageView.animate()
+                    .translationX(0f)
+                    .alpha(1f)
+                    .setDuration(145L)
+                    .withEndAction { animatingPage = false }
+                    .start()
+            }
+            .start()
+    }
+
+    private fun handleManualPositionChange(offset: Int) {
+        if (!audioSessionActive) return
+        if (audioPaused) {
+            startService(Intent(this, TtsPlaybackService::class.java).setAction(TtsPlaybackService.ACTION_STOP))
+            audioSessionActive = false
+            audioPaused = false
+            playButton.text = "▶"
+            audioInfo.text = "Текст · ▶ продолжит голосом с текущего места"
+        } else {
+            playFromOffset(offset)
+        }
     }
 
     private fun pageStart(index: Int): Int = pages[index.coerceIn(0, pages.lastIndex)]
@@ -434,12 +596,12 @@ class MainActivity : AppCompatActivity() {
     private fun updateChrome(offset: Int) {
         if (currentText.isEmpty()) return
         val safe = offset.coerceIn(0, currentText.length)
-        val percent = ((safe.toDouble() / currentText.length.toDouble()) * 100.0).toInt().coerceIn(0, 100)
-        pageInfo.text = "${currentPage + 1} / ${pages.size}   •   $percent%"
+        val percent = ((safe.toDouble() / currentText.length.toDouble()) * 100.0)
+            .toInt().coerceIn(0, 100)
+        pageInfo.text = "${currentPage + 1} / ${pages.size}   ·   $percent%"
         if (!changingSeek) {
             seekBar.progress = ((safe.toDouble() / currentText.length.toDouble()) * 10_000.0)
-                .toInt()
-                .coerceIn(0, 10_000)
+                .toInt().coerceIn(0, 10_000)
         }
     }
 
@@ -448,9 +610,18 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Сначала откройте книгу", Toast.LENGTH_SHORT).show()
             return
         }
-        val intent = Intent(this, TtsPlaybackService::class.java)
-            .setAction(TtsPlaybackService.ACTION_TOGGLE)
-        startTtsService(intent)
+        when {
+            audioSessionActive && !audioPaused -> {
+                startService(Intent(this, TtsPlaybackService::class.java).setAction(TtsPlaybackService.ACTION_PAUSE))
+            }
+            audioSessionActive && audioPaused -> {
+                startService(Intent(this, TtsPlaybackService::class.java).setAction(TtsPlaybackService.ACTION_RESUME))
+            }
+            else -> {
+                val offset = store.loadBook()?.offset ?: pageStart(currentPage)
+                playFromOffset(offset.coerceIn(0, currentText.length))
+            }
+        }
     }
 
     private fun playFromOffset(offset: Int) {
@@ -458,37 +629,73 @@ class MainActivity : AppCompatActivity() {
             action = TtsPlaybackService.ACTION_PLAY
             putExtra(TtsPlaybackService.EXTRA_OFFSET, offset.coerceIn(0, currentText.length))
         }
-        startTtsService(intent)
-    }
-
-    private fun startTtsService(intent: Intent) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            ContextCompat.startForegroundService(this, intent)
-        } else {
-            startService(intent)
-        }
+        ContextCompat.startForegroundService(this, intent)
     }
 
     private fun cycleSpeed() {
         val current = store.loadBook()?.speed ?: 1.0f
-        val values = floatArrayOf(0.75f, 0.9f, 1.0f, 1.15f, 1.3f, 1.5f, 1.75f)
+        val values = floatArrayOf(0.75f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f)
         val next = values.firstOrNull { it > current + 0.01f } ?: values.first()
         store.updateSpeed(next)
         speedButton.text = formatSpeed(next)
-        if (audioSessionActive) playFromOffset(store.loadBook()?.offset ?: pageStart(currentPage))
+        if (audioSessionActive && !audioPaused) playFromOffset(store.loadBook()?.offset ?: pageStart(currentPage))
+        if (audioSessionActive && audioPaused) handleManualPositionChange(store.loadBook()?.offset ?: pageStart(currentPage))
     }
 
-    private fun formatSpeed(speed: Float): String = String.format(Locale.US, "%.2g×", speed)
+    private fun toggleRoles() {
+        val current = store.loadBook()?.rolesEnabled ?: true
+        store.updateRolesEnabled(!current)
+        refreshSettingsButtons()
+        if (audioSessionActive && !audioPaused) playFromOffset(store.loadBook()?.offset ?: pageStart(currentPage))
+        if (audioSessionActive && audioPaused) handleManualPositionChange(store.loadBook()?.offset ?: pageStart(currentPage))
+    }
+
+    private fun cycleNarratorVoice() {
+        val current = store.loadBook()?.narratorSid ?: 0
+        store.updateNarratorSid((current + 1) % 10)
+        refreshSettingsButtons()
+        if (audioSessionActive && !audioPaused) playFromOffset(store.loadBook()?.offset ?: pageStart(currentPage))
+        if (audioSessionActive && audioPaused) handleManualPositionChange(store.loadBook()?.offset ?: pageStart(currentPage))
+    }
 
     private fun changeFont(delta: Float) {
-        val book = store.loadBook()
-        val current = book?.fontSize ?: pageView.textSize / resources.displayMetrics.scaledDensity
+        val current = store.loadBook()?.fontSize
+            ?: (pageView.textSize / resources.displayMetrics.scaledDensity)
         val next = (current + delta).coerceIn(14f, 36f)
-        val offset = book?.offset ?: pageStart(currentPage)
+        val anchor = store.loadBook()?.offset ?: pageStart(currentPage)
         store.updateFontSize(next)
         pageView.textSize = next
-        recalculatePages(offset)
+        pageView.post { recalculatePages(anchor.coerceIn(0, currentText.length)) }
     }
+
+    private fun refreshSettingsButtons() {
+        val book = store.loadBook()
+        val roles = book?.rolesEnabled ?: true
+        val narrator = book?.narratorSid ?: 0
+        val speed = book?.speed ?: 1.0f
+        if (::rolesButton.isInitialized) rolesButton.text = if (roles) "Роли: вкл" else "Роли: выкл"
+        if (::voiceButton.isInitialized) voiceButton.text = "Рассказчик ${narrator + 1}"
+        if (::speedButton.isInitialized) speedButton.text = formatSpeed(speed)
+    }
+
+    private fun toggleChromeVisibility() {
+        chromeVisible = !chromeVisible
+        val targetAlpha = if (chromeVisible) 1f else 0f
+        val targetVisibility = if (chromeVisible) View.VISIBLE else View.INVISIBLE
+        if (chromeVisible) {
+            topChrome.visibility = View.VISIBLE
+            bottomChrome.visibility = View.VISIBLE
+        }
+        topChrome.animate().alpha(targetAlpha).setDuration(150L).withEndAction {
+            if (!chromeVisible) topChrome.visibility = targetVisibility
+        }.start()
+        bottomChrome.animate().alpha(targetAlpha).setDuration(150L).withEndAction {
+            if (!chromeVisible) bottomChrome.visibility = targetVisibility
+        }.start()
+    }
+
+    private fun formatSpeed(speed: Float): String =
+        String.format(Locale.US, if (speed == 1.0f) "1.0×" else "%.2g×", speed)
 
     private fun handleIncoming(intent: Intent?) {
         if (intent?.action == Intent.ACTION_VIEW) intent.data?.let { importBook(it) }
@@ -507,12 +714,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 147)
         }
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    companion object {
+        private const val LINE_SPACING = 1.27f
+    }
 }

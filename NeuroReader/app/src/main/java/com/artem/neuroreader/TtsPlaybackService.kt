@@ -53,7 +53,7 @@ class TtsPlaybackService : Service() {
             ACTION_SEEK -> {
                 val saved = store.loadBook()
                 if (saved != null) {
-                    val delta = intent.getIntExtra(EXTRA_DELTA, 0)
+                    val delta = intent?.getIntExtra(EXTRA_DELTA, 0) ?: 0
                     startPlayback((saved.offset + delta).coerceAtLeast(0))
                 }
             }

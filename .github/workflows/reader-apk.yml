@@ -88,6 +88,15 @@ jobs:
           test -f "$MODEL/unicode_indexer.bin"
           test -f "$MODEL/voice.bin"
 
+      - name: Bundle offline Russian stress dictionary
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 \
+            -o NeuroReader/app/src/main/assets/tts/ru-stress-dict.txt \
+            https://raw.githubusercontent.com/dbklim/StressRNN/master/stressrnn/dicts/exception_dictionary.txt
+          test "$(wc -l < NeuroReader/app/src/main/assets/tts/ru-stress-dict.txt)" -gt 90000
+
       - name: Build debug APK
         working-directory: NeuroReader
         run: gradle --no-daemon --stacktrace :app:assembleDebug
@@ -95,14 +104,14 @@ jobs:
       - name: Prepare APK
         shell: bash
         run: |
-          cp NeuroReader/app/build/outputs/apk/debug/app-debug.apk NeuroReader-v3-Supertonic-arm64.apk
-          sha256sum NeuroReader-v3-Supertonic-arm64.apk > NeuroReader-v3-Supertonic-arm64.apk.sha256
+          cp NeuroReader/app/build/outputs/apk/debug/app-debug.apk NeuroReader-v4-LiveRussian-arm64.apk
+          sha256sum NeuroReader-v4-LiveRussian-arm64.apk > NeuroReader-v4-LiveRussian-arm64.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NeuroReader-v3-APK
+          name: NeuroReader-v4-APK
           path: |
-            NeuroReader-v3-Supertonic-arm64.apk
-            NeuroReader-v3-Supertonic-arm64.apk.sha256
+            NeuroReader-v4-LiveRussian-arm64.apk
+            NeuroReader-v4-LiveRussian-arm64.apk.sha256
           retention-days: 30

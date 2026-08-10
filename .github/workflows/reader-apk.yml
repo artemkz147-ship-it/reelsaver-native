@@ -1,0 +1,83 @@
+name: Build NeuroReader APK
+
+on:
+  push:
+    branches: [reader-app]
+    paths:
+      - 'NeuroReader/**'
+      - '.github/workflows/reader-apk.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'NeuroReader/**'
+      - '.github/workflows/reader-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Android SDK 36
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: Download sherpa-onnx Android AAR
+        shell: bash
+        run: |
+          mkdir -p NeuroReader/app/libs
+          curl -L --fail --retry 3 \
+            -o NeuroReader/app/libs/sherpa-onnx.aar \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar \
+          || curl -L --fail --retry 3 \
+            -o NeuroReader/app/libs/sherpa-onnx.aar \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-1.13.2.aar
+
+      - name: Bundle Russian neural voice
+        shell: bash
+        run: |
+          mkdir -p NeuroReader/app/src/main/assets/tts
+          curl -L --fail --retry 3 \
+            -o /tmp/irina.tar.bz2 \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-ru_RU-irina-medium.tar.bz2
+          tar -xjf /tmp/irina.tar.bz2 -C NeuroReader/app/src/main/assets/tts
+          test -f NeuroReader/app/src/main/assets/tts/vits-piper-ru_RU-irina-medium/ru_RU-irina-medium.onnx
+
+      - name: Build debug APK
+        working-directory: NeuroReader
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Prepare APK
+        shell: bash
+        run: |
+          cp NeuroReader/app/build/outputs/apk/debug/app-debug.apk NeuroReader-debug-arm64.apk
+          sha256sum NeuroReader-debug-arm64.apk > NeuroReader-debug-arm64.apk.sha256
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeuroReader-APK
+          path: |
+            NeuroReader-debug-arm64.apk
+            NeuroReader-debug-arm64.apk.sha256
+          retention-days: 30

@@ -54,9 +54,7 @@ jobs:
           if [ -z "$SDKMANAGER" ]; then
             SDK_ROOT="$RUNNER_TEMP/android-sdk"
             mkdir -p "$SDK_ROOT/cmdline-tools"
-            curl -L --fail --retry 3 \
-              -o "$RUNNER_TEMP/cmdline-tools.zip" \
-              https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip
+            curl -L --fail --retry 3 -o "$RUNNER_TEMP/cmdline-tools.zip" https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip
             unzip -q "$RUNNER_TEMP/cmdline-tools.zip" -d "$RUNNER_TEMP/cmdline-unpacked"
             mv "$RUNNER_TEMP/cmdline-unpacked/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
             SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
@@ -70,22 +68,25 @@ jobs:
         shell: bash
         run: |
           mkdir -p NeuroReader/app/libs
-          curl -L --fail --retry 3 \
-            -o NeuroReader/app/libs/sherpa-onnx.aar \
-            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar \
-          || curl -L --fail --retry 3 \
-            -o NeuroReader/app/libs/sherpa-onnx.aar \
-            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-1.13.2.aar
+          curl -L --fail --retry 3 -o NeuroReader/app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar
 
-      - name: Bundle Russian neural voice
+      - name: Bundle Russian Supertonic 3 voice pack
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p NeuroReader/app/src/main/assets/tts
           curl -L --fail --retry 3 \
-            -o /tmp/irina.tar.bz2 \
-            https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-ru_RU-irina-medium.tar.bz2
-          tar -xjf /tmp/irina.tar.bz2 -C NeuroReader/app/src/main/assets/tts
-          test -f NeuroReader/app/src/main/assets/tts/vits-piper-ru_RU-irina-medium/ru_RU-irina-medium.onnx
+            -o /tmp/supertonic3.tar.bz2 \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2
+          tar -xjf /tmp/supertonic3.tar.bz2 -C NeuroReader/app/src/main/assets/tts
+          MODEL=NeuroReader/app/src/main/assets/tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11
+          test -f "$MODEL/duration_predictor.int8.onnx"
+          test -f "$MODEL/text_encoder.int8.onnx"
+          test -f "$MODEL/vector_estimator.int8.onnx"
+          test -f "$MODEL/vocoder.int8.onnx"
+          test -f "$MODEL/tts.json"
+          test -f "$MODEL/unicode_indexer.bin"
+          test -f "$MODEL/voice.bin"
 
       - name: Build debug APK
         working-directory: NeuroReader
@@ -94,14 +95,14 @@ jobs:
       - name: Prepare APK
         shell: bash
         run: |
-          cp NeuroReader/app/build/outputs/apk/debug/app-debug.apk NeuroReader-debug-arm64.apk
-          sha256sum NeuroReader-debug-arm64.apk > NeuroReader-debug-arm64.apk.sha256
+          cp NeuroReader/app/build/outputs/apk/debug/app-debug.apk NeuroReader-v3-Supertonic-arm64.apk
+          sha256sum NeuroReader-v3-Supertonic-arm64.apk > NeuroReader-v3-Supertonic-arm64.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NeuroReader-APK
+          name: NeuroReader-v3-APK
           path: |
-            NeuroReader-debug-arm64.apk
-            NeuroReader-debug-arm64.apk.sha256
+            NeuroReader-v3-Supertonic-arm64.apk
+            NeuroReader-v3-Supertonic-arm64.apk.sha256
           retention-days: 30
